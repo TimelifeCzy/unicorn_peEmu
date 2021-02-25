@@ -21,3 +21,5 @@ unicorn: https://github.com/unicorn-engine/unicorn
 
 unicorn_pe: https://github.com/hzqst/unicorn_pe
 
+qilin: https://github.com/qilingframework/qiling
+
