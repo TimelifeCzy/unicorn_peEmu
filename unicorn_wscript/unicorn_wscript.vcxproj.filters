@@ -25,6 +25,9 @@
     <Filter Include="mem">
       <UniqueIdentifier>{5f04ca08-02d8-4cfc-b6bb-af99084fa1f6}</UniqueIdentifier>
     </Filter>
+    <Filter Include="capstone">
+      <UniqueIdentifier>{f44363a7-e0fd-4aed-a2ae-992735e0a129}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp">
@@ -42,6 +45,9 @@
     <ClCompile Include="mem.cpp">
       <Filter>mem</Filter>
     </ClCompile>
+    <ClCompile Include="Capstone.cpp">
+      <Filter>capstone</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="windows.h">
@@ -58,6 +64,9 @@
     </ClInclude>
     <ClInclude Include="mem.h">
       <Filter>mem</Filter>
+    </ClInclude>
+    <ClInclude Include="Capstone.h">
+      <Filter>capstone</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

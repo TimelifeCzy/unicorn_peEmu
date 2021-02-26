@@ -148,6 +148,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="Capstone.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="mem.cpp" />
     <ClCompile Include="PeEmu.cpp" />
@@ -155,6 +156,7 @@
     <ClCompile Include="windows.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="Capstone.h" />
     <ClInclude Include="mem.h" />
     <ClInclude Include="nativestructs.h" />
     <ClInclude Include="PeEmu.h" />

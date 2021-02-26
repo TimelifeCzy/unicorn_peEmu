@@ -8,6 +8,8 @@
 #define AlignSize(Size, Align) (Size+Align-1)/Align*Align
 #define PAGE_SIZE 0x1000
 
+uint64_t PeEmu::m_LastException = 0;
+
 extern wstring wSampleName;
 
 typedef struct _Moduole_LdrData
@@ -27,6 +29,9 @@ PeEmu::PeEmu(
 		printf("failed to uc_open %d\n", err);
 		m_initerrorstatus = false;
 	}
+
+	// Init AnAsm
+	m_CapAnasm->InitCapstone();
 
 	// Load Analys samplefile
 	PuPEInfo peinfo;
@@ -116,7 +121,7 @@ bool PeEmu::SamplePeMapImage()
 		return false;
 	RtlSecureZeroMemory(ImageBaseMapaddr, m_ImageSize);
 	m_ImageBase = (uint64_t)ImageBaseMapaddr;
-	m_ImageEnd = m_ImageBase + m_ImageSize - 0x1000;
+	m_ImageEnd = m_ImageBase + m_ImageSize;
 	// copy hander
 	RtlCopyMemory(ImageBaseMapaddr, (void*)MapBaseaddr, headerssize);
 
@@ -145,11 +150,13 @@ bool PeEmu::SamplePeMapImage()
 	IMAGE_NT_HEADERS* mapNtHeader = (IMAGE_NT_HEADERS*)((BYTE*)mapDosHeader + mapDosHeader->e_lfanew);
 	PIMAGE_IMPORT_DESCRIPTOR mapImportTabe = (PIMAGE_IMPORT_DESCRIPTOR)(mapNtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress + (BYTE*)m_ImageBase);
 	PIMAGE_BASE_RELOCATION mapLoc = (PIMAGE_BASE_RELOCATION)(mapNtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress + (BYTE*)m_ImageBase);
-	m_ImportBaseAddr = (uint64_t)mapImportTabe;
+	
 	// sample map && iat && rep
+	m_ImportBaseAddr = (uint64_t)mapImportTabe;
 	this->InitsampleIatRep();
 
-	// modify ImageBase & oep
+	mapNtHeader->OptionalHeader.ImageBase = m_ImageBase;
+	m_oep = mapNtHeader->OptionalHeader.ImageBase + mapNtHeader->OptionalHeader.AddressOfEntryPoint;
 
 	// map
 	uc_mem_map(m_uc, m_ImageBase, m_ImageSize, UC_PROT_EXEC | UC_PROT_READ | UC_PROT_EXEC);
@@ -461,7 +468,6 @@ uint64_t PeEmu::InitSysDLL(
 		moddll.DllPath = dllpath;
 
 		// Map File
-
 		HANDLE hfile = CreateFileA(
 			dllpath.c_str(), FILE_GENERIC_READ,
 			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -497,7 +503,8 @@ uint64_t PeEmu::InitSysDLL(
 		auto ImageBaseMapaddr = ExAllocMemory(moddll.ImageSize);
 		if (!ImageBaseMapaddr)
 			return false;
-		RtlSecureZeroMemory(ImageBaseMapaddr, moddll.ImageSize);		
+		RtlSecureZeroMemory(ImageBaseMapaddr, moddll.ImageSize);
+
 		// copy hander
 		RtlCopyMemory(ImageBaseMapaddr, (void*)MapBaseaddr, headerssize);
 
@@ -682,12 +689,145 @@ void PeEmu::RepairTheIAT(
 	}
 }
 
+static void IntrCallback(
+	uc_engine *uc, 
+	int exception, 
+	void *user_data
+)
+{
+	if (exception == EXCP01_DB)
+	{
+		PeEmu::m_LastException = STATUS_SINGLE_STEP;
+	}
+	else if (exception == EXCP03_INT3)
+	{
+		PeEmu::m_LastException = STATUS_BREAKPOINT;
+	}
+	else
+	{
+		PeEmu::m_LastException = ((NTSTATUS)0x00000000L);
+	}
+	uc_emu_stop(uc);
+}
+
+static void BlockCallback(
+	uc_engine *uc, 
+	uint64_t address, 
+	uint32_t size, 
+	void *user_data
+)
+{
+	PeEmu* peobj = (PeEmu*)user_data;
+	
+	// output address asm
+	if (peobj->m_CapAnasm)
+	{
+		// read current exec map_opcode
+		unsigned char codeBuffer[16] = { 0, };
+		uc_mem_read(uc, address, codeBuffer, size);
+
+		// asm output
+		peobj->m_CapAnasm->ShowAssembly(codeBuffer, 1);
+	}
+
+	bool api_status = false;
+	// Map.api.find(addr) if true ? api emu : api error
+	for (size_t idx = 0; idx < peobj->current_dlls_map.size(); ++idx)
+	{
+		auto iter = peobj->current_dlls_map[idx].dll_functionaddr_map.find(address);
+		if (iter != peobj->current_dlls_map[idx].dll_functionaddr_map.end())
+		{
+			// find ok 
+
+			// dispatch win_api emu_handle
+			api_status = true;
+			break;
+		}
+	}
+
+	if (api_status == false)
+	{
+		// error: no find api exception
+		
+	}
+
+}
+
+static void InvalidCallback(
+	uc_engine *uc, 
+	uc_mem_type type,
+	uint64_t address, 
+	int size, 
+	int64_t value, 
+	void *user_data
+)
+{
+	switch (type)
+	{
+	case UC_MEM_FETCH_PROT:
+		break;
+	case UC_MEM_WRITE_PROT:
+		break;
+	case UC_MEM_FETCH_UNMAPPED:
+		break;
+	case UC_MEM_READ_UNMAPPED:
+		break;
+	case UC_MEM_WRITE_UNMAPPED:
+		break;
+	case UC_MEM_READ:
+		break;
+	case UC_MEM_WRITE:
+		break;
+	case UC_MEM_FETCH:
+		break;
+	}
+
+	// exec log
+	printf("error: uc_mem_type: %d uint64_t: 0x%X\r\n", type, address);
+	system("pause");
+}
+
 bool PeEmu::prRun(
 )
 {
-	// set hook callback 
+	uc_hook trace, trace2, trace3;
 
+	// Monitor opencode & api handle
+	uc_hook_add(m_uc, &trace, UC_HOOK_BLOCK, 
+		BlockCallback, this, 1, 0);
+
+	// uc_emu_start ? success : faliure
+	uc_hook_add(m_uc, &trace2, UC_HOOK_INTR,
+		IntrCallback, NULL, 1, 0);
+
+	// Map exec error breakpointer invalid except handle
+	uc_hook_add(m_uc, &trace3, UC_HOOK_MEM_INVALID, 
+		InvalidCallback, NULL, 1, 0);
+	
 	// start unicorn
+	while (1)
+	{
+		auto err = uc_emu_start(m_uc, m_oep, m_ImageEnd, 0, 0);
+		if (this->m_LastException != ((NTSTATUS)0x00000000L))
+		{
+			auto except = this->m_LastException;
+			this->m_LastException = ((NTSTATUS)0x00000000L);
+			// error exception handle
+		}
+		else
+		{
+			break;
+		}
+	}
+
+	uc_hook_del(m_uc, trace);
+	uc_hook_del(m_uc, trace2);
+	uc_hook_del(m_uc, trace3);
+
+	uc_close(m_uc);
+	m_CapAnasm->Close();
+
+	// Unmap sample mem
 
 	return 0;
 }
