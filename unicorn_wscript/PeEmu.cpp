@@ -3,7 +3,10 @@
 
 #include "mem.h"
 #include "PeEmu.h"
+#include "emuwindows.h"
 #include "nativestructs.h"
+
+
 
 #define AlignSize(Size, Align) (Size+Align-1)/Align*Align
 #define PAGE_SIZE 0x1000
@@ -11,6 +14,12 @@
 uint64_t PeEmu::m_LastException = 0;
 
 extern wstring wSampleName;
+
+// All_DLL_Api 用于修复重定位，以函数名为Key
+map<string, uint64_t> g_dll_StringInt_Map;
+
+// 注册Winapi全局Map
+map<uint64_t, uint64_t>g_WinApi_callback_handle;
 
 typedef struct _Moduole_LdrData
 {
@@ -31,7 +40,8 @@ PeEmu::PeEmu(
 	}
 
 	// Init AnAsm
-	m_CapAnasm->InitCapstone();
+	// this->InitCapstone();
+	m_CapAnasm.InitCapstone();
 
 	// Load Analys samplefile
 	PuPEInfo peinfo;
@@ -50,7 +60,6 @@ PeEmu::PeEmu(
 		// x64
 		m_stackBaseaddr = 0x40000;
 		m_stackSize = 0x10000;
-		m_ImageEnd = m_stackBaseaddr + m_stackSize - 0x1000;
 		m_heapBaseaddr = 0x10000000ull;
 		m_heapSize = 0x1000000ull;
 	}
@@ -62,6 +71,8 @@ PeEmu::PeEmu(
 	// init sys_dll_list
 	sys_dll_map["ntdll.dll"] = 0;
 	sys_dll_map["kernel32.dll"] = 0;
+	// sys_dll_map["KernelBase.dll"] = 0;
+
 	init_dlls_map["ntdll.dll"] = 0;
 	init_dlls_map["kernel32.dll"] = 0;
 	init_dlls_map["user32.dll"] = 0;
@@ -81,7 +92,8 @@ PeEmu::~PeEmu(
 }
 
 // Map Sample
-bool PeEmu::SamplePeMapImage()
+bool PeEmu::SamplePeMapImage(
+)
 {
 	if (m_wsamplename.size() <= 0)
 		return false;
@@ -191,14 +203,14 @@ bool PeEmu::prInitEmu(
 	this->SamplePeMapImage();
 
 	// Init Reg write uc
-	m_InitReg.Rsp = m_ImageEnd;
-	m_InitReg.Rbp = m_ImageEnd;
+	m_InitReg.Rsp = m_stackBaseaddr + m_stackSize - 0x1000;
 	m_InitReg.Rcx = m_ImageBase;
 	m_InitReg.Rdx = DLL_PROCESS_ATTACH;
 	m_InitReg.R8 = 0;
 
+	uc_mem_write(m_uc, m_InitReg.Rsp, &m_ImageEnd,sizeof(m_InitReg.Rsp));
 	uc_mem_map(m_uc, m_ImageEnd, 0x1000, UC_PROT_EXEC | UC_PROT_READ);
-	uc_mem_write(m_uc, m_InitReg.Rsp, &m_ImageEnd, sizeof(m_ImageEnd));
+	
 	uc_reg_write(m_uc, UC_X86_REG_RAX, &m_InitReg.Rax);
 	uc_reg_write(m_uc, UC_X86_REG_RBX, &m_InitReg.Rbx);
 	uc_reg_write(m_uc, UC_X86_REG_RCX, &m_InitReg.Rcx);
@@ -269,30 +281,42 @@ bool PeEmu::InitGdtr(
 	err = uc_mem_write(m_uc, kpcr_base, &kpcr, sizeof(KPCR));
 	err = uc_reg_write(m_uc, UC_X86_REG_GDTR, &gdtr);
 
+	// 33 00110011
 	SegmentSelector cs = { 0 };
-	cs.fields.index = 1;
+	cs.all = 0x33;
+	//cs.fields.index = 1;
 	uc_reg_write(m_uc, UC_X86_REG_CS, &cs.all);
 
+	// 2b 00101011
 	SegmentSelector ds = { 0 };
-	ds.fields.index = 2;
+	ds.all = 0x2b;
+	//ds.fields.index = 2;
 	uc_reg_write(m_uc, UC_X86_REG_DS, &ds.all);
 
+	// 2b 00101011
 	SegmentSelector ss = { 0 };
-	ss.fields.index = 2;
+	ss.all = 0x2b;
+	//ss.fields.index = 2;
 	uc_reg_write(m_uc, UC_X86_REG_SS, &ss.all);
 
+	// 2b 00101011
 	SegmentSelector es = { 0 };
-	es.fields.index = 2;
+	es.all = 0x2b;
+	//es.fields.index = 2;
 	uc_reg_write(m_uc, UC_X86_REG_ES, &es.all);
 
+	// 2b 00101011
 	SegmentSelector gs = { 0 };
+	//gs.all = 0x2b;
 	gs.fields.index = 2;
 	uc_reg_write(m_uc, UC_X86_REG_GS, &gs.all);
 
+	// 246 001001000110
 	FlagRegister eflags = { 0 };
-	eflags.fields.id = 1;
-	eflags.fields.intf = 1;
-	eflags.fields.reserved1 = 1;
+	eflags.all = 0x246;
+	//eflags.fields.id = 1;
+	//eflags.fields.intf = 1;
+	//eflags.fields.reserved1 = 1;
 
 	uc_reg_write(m_uc, UC_X86_REG_EFLAGS, &eflags.all);
 
@@ -374,6 +398,53 @@ void PeEmu::InsertTailList(
 	uc_mem_write(m_uc, ListHeadAddress + offsetof(LIST_ENTRY, Blink), &EntryAddress, sizeof(EntryAddress));
 }
 
+uint64_t PeEmu::MyGetProcess(
+	DWORD64 dwMoudle,
+	uint64_t mapBase,
+	string Name
+)
+{
+	PIMAGE_DOS_HEADER pDos = (PIMAGE_DOS_HEADER)dwMoudle;
+	PIMAGE_NT_HEADERS pNt = (PIMAGE_NT_HEADERS)(pDos->e_lfanew + (DWORD64)dwMoudle);
+	PIMAGE_EXPORT_DIRECTORY pExport = (PIMAGE_EXPORT_DIRECTORY)(pNt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress + dwMoudle);
+
+	// 函数名个数
+	DWORD dwNumberofName = pExport->NumberOfNames;
+	// 函数个数
+	DWORD dwnumberoffun = pExport->NumberOfFunctions;
+	uint64_t  eat = (uint64_t)pExport->AddressOfFunctions + dwMoudle;
+	uint64_t   eot = (uint64_t)pExport->AddressOfNameOrdinals + dwMoudle;
+	uint64_t ent = (uint64_t)pExport->AddressOfNames + dwMoudle;
+
+	for (int i = 0; i < dwNumberofName; ++i)
+	{
+		DWORD dwNameoffset = *(DWORD *)(ent + (i * 4));
+		if (!dwNameoffset)
+			continue;
+		char* Names = (char*)(dwNameoffset + dwMoudle);
+		if (!Names)
+			continue;
+
+		// find ok
+		if (0 == strcmp(Name.data(),Names))
+		{
+			// eot find index
+			WORD idex = *(WORD*)(eot + (i * 2));
+			if (!idex)
+				break;
+
+			// eat find addr : rva
+			DWORD addrrva = *(DWORD *)(eat + (i * 4));
+			if (!addrrva)
+				break;
+
+			// mapaddr + addrrva = map_va
+			return mapBase + addrrva;
+		}
+	}
+	return false;
+}
+
 bool PeEmu::MapInsertIat(
 	IMAGE_IMPORT_DESCRIPTOR * pImportTabe,
 	DWORD64 dwMoudle,
@@ -382,7 +453,8 @@ bool PeEmu::MapInsertIat(
 )
 {
 	string funname;
-	DWORD64 ImportTabVA = 0, FunAddress = 0;
+	DWORD64 ImportTabVA = 0;
+	uint64_t Mapvaaddr = 0;
 	PIMAGE_IMPORT_DESCRIPTOR pImport = pImportTabe;
 	DWORD Att_old = 0;
 	// dll_Name
@@ -391,6 +463,9 @@ bool PeEmu::MapInsertIat(
 		char* Name = (char*)(pImport->Name + dwMoudle);
 		PIMAGE_THUNK_DATA pThunkINT = (PIMAGE_THUNK_DATA)(pImport->OriginalFirstThunk + dwMoudle);
 		PIMAGE_THUNK_DATA pThunkIAT = (PIMAGE_THUNK_DATA)(pImport->FirstThunk + dwMoudle);
+		HMODULE hmod = GetModuleHandleA(Name);
+		if (!hmod)
+			continue;
 		while (pThunkINT->u1.AddressOfData)
 		{
 			if (!IMAGE_SNAP_BY_ORDINAL(pThunkIAT->u1.Ordinal))
@@ -400,21 +475,42 @@ bool PeEmu::MapInsertIat(
 				funname = pName->Name;
 
 				// insert mapaddr_offset
-				//mod->dll_functionaddr_map[uint64_t(pThunkINT->u1.Function + dwMoudle)] = funname.data();
-				mod->dll_functionaddr_map[pThunkINT->u1.Function + mapBase] = funname;
-
-				// MapAddr + offset = iat
-				pThunkINT->u1.Function = pThunkINT->u1.Function + mapBase;
+				// uint64_t Mapvaaddr = (uint64_t)GetProcAddress(hmod, funname.data());
+				uint64_t Mapvaaddr = MyGetProcess((DWORD64)dwMoudle, mapBase, funname);
+				if (Mapvaaddr)
+				{
+					// Mapvaaddr = mapBase + (Mapvaaddr - (uint64_t)hmod);
+					g_dll_StringInt_Map[funname] = Mapvaaddr;
+					mod->dll_functionaddr_map[Mapvaaddr] = funname;
+					// MapAddr + offset = iat
+					pThunkINT->u1.Function = Mapvaaddr;
+				}
 			}
-			//else
-			//{
-			//	DWORD64 dwFunOrdinal = IMAGE_ORDINAL((pThunkIAT->u1.Ordinal));
-			//	mod->dll_functionaddr_map[pThunkINT->u1.Function + dwMoudle] = dwFunOrdinal;
-			//}
+			else
+			{
+				DWORD64 dwFunOrdinal = IMAGE_ORDINAL((pThunkIAT->u1.Ordinal));
+				Mapvaaddr = (uint64_t)GetProcAddress(hmod, (char*)dwFunOrdinal);
+				if (Mapvaaddr)
+				{
+					Mapvaaddr = mapBase + (Mapvaaddr - (uint64_t)hmod);
+					g_dll_StringInt_Map[funname] = Mapvaaddr;
+					mod->dll_functionaddr_map[Mapvaaddr] = funname;
+					// MapAddr + offset = iat
+					pThunkINT->u1.Function = Mapvaaddr;
+				}
+			}
 			++pThunkINT;
 			++pThunkIAT;
 		}
 		++pImport;
+	}
+	// not GetCurrentThreadId function??
+	auto hmod = GetModuleHandle(L"kernel32.dll");
+	uint64_t threadidbase = (uint64_t)GetProcAddress(hmod,"GetCurrentThreadId");
+	if (threadidbase)
+	{
+		Mapvaaddr = mapBase + (threadidbase - (uint64_t)hmod);
+		g_dll_StringInt_Map["GetCurrentThreadId"] = Mapvaaddr;
 	}
 	return 0;
 }
@@ -461,6 +557,7 @@ uint64_t PeEmu::InitSysDLL(
 	uint64_t MudllMapAddr = 0;
 	for (map<string, uint64_t>::iterator it = sys_dll_map.begin(); it != sys_dll_map.end(); ++it)
 	{
+
 		dllpath = "C:\\Windows\\System32\\";
 		dllpath += it->first;
 
@@ -596,6 +693,32 @@ bool PeEmu::InitsampleIatRep(
 	//
 	this->RepairReloCation((PIMAGE_DOS_HEADER)m_ImageBase);
 
+	// register emu_api
+	// oep _ api
+	EmuOsWindows emuobj;
+	this->RegisterEmuWinApi("GetSystemTimeAsFileTime", (uint64_t)emuobj.EmuGetSystemTimeAsFileTime);
+	this->RegisterEmuWinApi("GetCurrentThreadId", (uint64_t)emuobj.EmuGetCurrentThreadId);
+	this->RegisterEmuWinApi("GetCurrentProcessId", (uint64_t)emuobj.EmuGetCurrentProcessId);
+	this->RegisterEmuWinApi("QueryPerformanceCounter", (uint64_t)emuobj.EmuQueryPerformanceCounter);
+	this->RegisterEmuWinApi("LoadLibraryExW", (uint64_t)emuobj.EmuLoadLibraryExW);
+	this->RegisterEmuWinApi("LoadLibraryA", (uint64_t)emuobj.EmuLoadLibraryA);
+	this->RegisterEmuWinApi("GetProcAddress", (uint64_t)emuobj.EmuGetProcAddress);
+	this->RegisterEmuWinApi("GetModuleHandleA", (uint64_t)emuobj.EmuGetModuleHandleA);
+	this->RegisterEmuWinApi("GetLastError", (uint64_t)emuobj.EmuGetLastError);
+	this->RegisterEmuWinApi("InitializeCriticalSectionAndSpinCount", (uint64_t)emuobj.EmuInitializeCriticalSectionAndSpinCount);
+
+	if (!this->RegisterEmuWinApi( "InitializeCriticalSectionEx", (uint64_t)emuobj.EmuInitializeCriticalSectionEx))
+		this->RegisterEmuWinApi("InitializeCriticalSectionEx", (uint64_t)emuobj.EmuInitializeCriticalSectionEx);
+
+	this->RegisterEmuWinApi("RtlDeleteCriticalSection", (uint64_t)emuobj.EmuDeleteCriticalSection);
+	this->RegisterEmuWinApi("RtlIsProcessorFeaturePresent", (uint64_t)emuobj.EmuRtlIsProcessorFeaturePresent);
+	this->RegisterEmuWinApi("GetProcessAffinityMask", (uint64_t)emuobj.EmuGetProcessAffinityMask);
+
+	this->RegisterEmuWinApi("TlsAlloc", (uint64_t)emuobj.EmuTlsAlloc);
+	this->RegisterEmuWinApi("TlsSetValue", (uint64_t)emuobj.EmuTlsSetValue);
+	this->RegisterEmuWinApi("TlsFree", (uint64_t)emuobj.EmuTlsFree);
+	this->RegisterEmuWinApi("LocalAlloc", (uint64_t)emuobj.EmuLocalAlloc);
+	this->RegisterEmuWinApi("NtProtectVirtualMemory", (uint64_t)emuobj.EmuNtProtectVirtualMemory);
 	return true;
 }
 
@@ -647,22 +770,26 @@ void PeEmu::RepairTheIAT(
 	{
 		// sample dllname
 		char* Name = (char*)(pImport->Name + dwMoudle);
+
 		// find MapModList <sample dllname> MapModDllBaseAddr
 		for (size_t idx = 0; idx < current_dlls_map.size(); ++idx)
 		{
 			mod = current_dlls_map[idx];
-			if (mod.DllName == Name)
+			if ((mod.DllName == "kernel32.dll") && (0 == strcmp("KERNEL32.dll", Name)))
 			{
-				// Find OK
-				mapdllbaseaddr = mod.MapImageBase;
-				if (mapdllbaseaddr <= 0)
-					continue;
 				currentDllflags = true;
+				if (!mapdllbaseaddr)
+					mapdllbaseaddr = mod.MapImageBase;
+				break;
 			}
 		}
 		// currentDllflags为假,没有加载该DLL -- 不支持异常
 		if (currentDllflags == false)
-			return;
+		{
+			++pImport;
+			continue;
+		}
+
 
 		PIMAGE_THUNK_DATA pThunkINT = (PIMAGE_THUNK_DATA)(pImport->OriginalFirstThunk + dwMoudle);
 		PIMAGE_THUNK_DATA pThunkIAT = (PIMAGE_THUNK_DATA)(pImport->FirstThunk + dwMoudle);
@@ -672,15 +799,14 @@ void PeEmu::RepairTheIAT(
 			{
 				// FunctionName
 				PIMAGE_IMPORT_BY_NAME pName = (PIMAGE_IMPORT_BY_NAME)(pThunkINT->u1.AddressOfData + dwMoudle);
-				auto MapIataddr = pThunkINT->u1.Function + mapdllbaseaddr;
-				auto iter = mod.dll_functionaddr_map.find(MapIataddr);
-				if (iter != mod.dll_functionaddr_map.end())
+				auto iter = g_dll_StringInt_Map.find(pName->Name);
+				if (iter != g_dll_StringInt_Map.end())
 				{
-					pThunkIAT->u1.Function = MapIataddr;
+					pThunkIAT->u1.Function = iter->second;
+					unsigned char code[] = "\xC3";
+					uc_mem_write(m_uc, pThunkIAT->u1.Function, code, sizeof(code));
 				}
-				else
-					// exception handling <Levele ModApi>
-					return;
+
 			}
 			++pThunkINT;
 			++pThunkIAT;
@@ -718,18 +844,32 @@ static void BlockCallback(
 )
 {
 	PeEmu* peobj = (PeEmu*)user_data;
-	
 	// output address asm
-	if (peobj->m_CapAnasm)
-	{
-		// read current exec map_opcode
-		unsigned char codeBuffer[16] = { 0, };
-		uc_mem_read(uc, address, codeBuffer, size);
 
-		// asm output
-		peobj->m_CapAnasm->ShowAssembly(codeBuffer, 1);
-	}
+	// read current exec map_opcode
+	unsigned char codeBuffer[16] = { 0, };
+	uc_mem_read(uc, address, codeBuffer, size);
 
+	// asm output
+	peobj->m_CapAnasm.ShowAssembly(address, codeBuffer, 1);
+}
+
+static void CodeCallback(
+	uc_engine *uc,
+	uint64_t address, 
+	uint32_t size, 
+	void *user_data
+)
+{
+	PeEmu* peobj = (PeEmu*)user_data;
+	// output address asm
+
+	// read current exec map_opcode
+	unsigned char codeBuffer[16] = { 0, };
+	uc_mem_read(uc, address, codeBuffer, size);
+
+	// asm output
+	peobj->m_CapAnasm.ShowAssembly(address, codeBuffer, 1);
 	bool api_status = false;
 	// Map.api.find(addr) if true ? api emu : api error
 	for (size_t idx = 0; idx < peobj->current_dlls_map.size(); ++idx)
@@ -738,19 +878,13 @@ static void BlockCallback(
 		if (iter != peobj->current_dlls_map[idx].dll_functionaddr_map.end())
 		{
 			// find ok 
-
+			printf("Function Name = %s, addr = 0x%I64X\r\n",iter->second.data(), address);
 			// dispatch win_api emu_handle
 			api_status = true;
+			peobj->WinApiHandleCallback(uc, address, size, user_data);
 			break;
 		}
 	}
-
-	if (api_status == false)
-	{
-		// error: no find api exception
-		
-	}
-
 }
 
 static void InvalidCallback(
@@ -775,7 +909,9 @@ static void InvalidCallback(
 	case UC_MEM_WRITE_UNMAPPED:
 		break;
 	case UC_MEM_READ:
-		break;
+	{
+	}
+	break;
 	case UC_MEM_WRITE:
 		break;
 	case UC_MEM_FETCH:
@@ -783,18 +919,62 @@ static void InvalidCallback(
 	}
 
 	// exec log
-	printf("error: uc_mem_type: %d uint64_t: 0x%X\r\n", type, address);
+	printf("error: uc_mem_type: %d uint64_t: 0x%I64X\r\n", type, address);
+
+	unsigned char codeBuffer[16] = { 0, };
+	uc_mem_read(uc, address, codeBuffer, size);
+
 	system("pause");
+}
+
+void PeEmu::WinApiHandleCallback(uc_engine *uc, uint64_t address, uint32_t size, void *user_data)
+{
+	// find  map_addr <-- --> callbackfun
+	auto iter = g_WinApi_callback_handle.find(address);
+	if (iter != g_WinApi_callback_handle.end())
+	{
+		// 调用函数 - Emu_Api堆栈平衡 & 返回指 & 仿真处理
+		// 函数原型统一 
+		// uc_engine *uc, uint64_t address, uint32_t size, void *user_data void(*callback)
+		void(*callback)(uc_engine *uc, uint64_t address, uint32_t size, void *user_data)
+			= (decltype(callback))iter->second;
+
+		callback(uc, address, size, user_data);
+	}
+}
+
+bool PeEmu::RegisterEmuWinApi(
+	string apiname, 
+	uint64_t emuapibase
+)
+{
+	if ((apiname.size() <= 0) || (emuapibase <= 0))
+		return false;
+
+	// find name
+	auto iter = g_dll_StringInt_Map.find(apiname);
+	if (iter != g_dll_StringInt_Map.end())
+	{
+		// key 是 Map_Api地址
+		// values 是 Emu_Api地址
+		g_WinApi_callback_handle[iter->second] = emuapibase;
+		return true;
+	}
+
+	return false;
 }
 
 bool PeEmu::prRun(
 )
 {
-	uc_hook trace, trace2, trace3;
+	uc_hook trace, trace1, trace2, trace3;
 
 	// Monitor opencode & api handle
-	uc_hook_add(m_uc, &trace, UC_HOOK_BLOCK, 
-		BlockCallback, this, 1, 0);
+	// uc_hook_add(m_uc, &trace, UC_HOOK_BLOCK, 
+	// BlockCallback, this, 1, 0);
+	 
+	uc_hook_add(m_uc, &trace1, UC_HOOK_CODE,
+		CodeCallback, this, 1, 0);
 
 	// uc_emu_start ? success : faliure
 	uc_hook_add(m_uc, &trace2, UC_HOOK_INTR,
@@ -820,12 +1000,13 @@ bool PeEmu::prRun(
 		}
 	}
 
-	uc_hook_del(m_uc, trace);
+	// uc_hook_del(m_uc, trace);
+	uc_hook_del(m_uc, trace1);
 	uc_hook_del(m_uc, trace2);
 	uc_hook_del(m_uc, trace3);
 
 	uc_close(m_uc);
-	m_CapAnasm->Close();
+	m_CapAnasm.Close();
 
 	// Unmap sample mem
 

@@ -18,7 +18,7 @@ public:
 public:
 
 	void InitCapstone();
-	void ShowAssembly(const void* pAddr, int nLen);
+	void ShowAssembly(const __int64 mapexecripaddr, const void* pAddr, int nLen);
 	void Close();
 
 private:

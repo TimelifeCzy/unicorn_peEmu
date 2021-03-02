@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <vector>
 #include <map>
@@ -52,6 +52,8 @@ public:
 	bool puInitEmu() { return this->prInitEmu(); }
 	bool puRun() { return this->prRun(); }
 	bool puGetInitstatus() { return this->m_initerrorstatus; }
+	void WinApiHandleCallback(uc_engine *uc, uint64_t address, uint32_t size, void *user_data);
+	bool RegisterEmuWinApi(string apiname, uint64_t emuapibase);
 
 private:
 	bool prInitEmu();
@@ -70,6 +72,7 @@ private:
 		uint64_t pDos,
 		uint64_t mapBase
 	);
+	uint64_t MyGetProcess(DWORD64 dwMoudle, uint64_t mapBase, string Name);
 	bool InitsampleIatRep();
 	void InsertTailList(
 		IN ULONG64 ListHeadAddress,
@@ -79,13 +82,14 @@ private:
 	void RepairTheIAT(
 		IMAGE_IMPORT_DESCRIPTOR * pImportTabe,
 		DWORD64 dwMoudle);
-
 	bool SamplePeMapImage();
+
 
 public:
 	// DLL
 	map<string, uint64_t> sys_dll_map;
 	map<string, uint64_t> init_dlls_map;
+	// 以地址为Ket,每次进入code||block回调,地址判断
 	vector<ModDLL> current_dlls_map;
 	uint64_t m_ppeb_ldrdata_addr;
 	PEB_LDR_DATA m_ldrdata_struct;
@@ -115,7 +119,7 @@ public:
 
 	// classobj
 	uc_engine *m_uc;
-	Capstone *m_CapAnasm;
+	Capstone m_CapAnasm;
 	uc_x86_mmr gdtr;
 	_CONTEXT m_InitReg;
 
